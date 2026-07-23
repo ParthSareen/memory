@@ -67,6 +67,57 @@ func TestSchemaStorageAndFTS(t *testing.T) {
 	}
 }
 
+func TestMigrateV1DatabaseAddsWorkflowOverlay(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	store, err := Initialize(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"DROP TABLE work_items",
+		"PRAGMA user_version = 1",
+		"UPDATE metadata SET value = '1' WHERE key = 'schema_version'",
+	} {
+		if _, err := store.db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer migrated.Close()
+	version, err := migrated.SchemaVersion()
+	if err != nil || version != 2 {
+		t.Fatalf("schema version = %d, %v", version, err)
+	}
+	if _, err := migrated.db.Exec("INSERT INTO work_items(record_id, status) VALUES ('missing', 'active')"); err == nil {
+		t.Fatal("migrated work_items table did not preserve its foreign key")
+	}
+}
+
+func TestWorkflowUpdateIsAtomic(t *testing.T) {
+	store := newTestStore(t)
+	item, created, err := store.BeginWorkflow(RecordInput{Title: "Atomic workflow", Summary: "before"}, WorkflowInput{Status: WorkflowActive, Class: "build"})
+	if err != nil || !created {
+		t.Fatalf("begin workflow = %#v, %v, %v", item, created, err)
+	}
+	_, err = store.UpdateWorkflowItem(item.Record.ID, UpdateInput{Summary: stringValue("after failed update")}, WorkflowInput{Status: "invalid", Class: "build"})
+	if err == nil {
+		t.Fatal("expected invalid workflow status")
+	}
+	loaded, err := store.WorkflowItem(item.Record.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Status != WorkflowActive || loaded.Record.Summary != "before" || loaded.Record.Status != "active" {
+		t.Fatalf("failed workflow update mutated state: %#v", loaded)
+	}
+}
+
 func TestWeightedFTSRanksTitleAboveEvidence(t *testing.T) {
 	store := newTestStore(t)
 	titleMatch := createRecord(t, store, RecordInput{Title: "Quokka migration", Summary: "Routine implementation."})

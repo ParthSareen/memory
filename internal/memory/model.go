@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	SchemaVersion = 1
+	SchemaVersion = 2
 	ExportFormat  = "work-memory"
 	ExportVersion = 1
 )
@@ -105,6 +105,64 @@ type Record struct {
 	Tags          []string       `json:"tags"`
 	Links         []ExternalLink `json:"links"`
 	Relationships []Relationship `json:"relationships,omitempty"`
+}
+
+// WorkflowStatus is the deliberately small state vocabulary for active work.
+type WorkflowStatus string
+
+const (
+	WorkflowActive  WorkflowStatus = "active"
+	WorkflowWaiting WorkflowStatus = "waiting"
+	WorkflowBlocked WorkflowStatus = "blocked"
+	WorkflowClosed  WorkflowStatus = "closed"
+	WorkflowParked  WorkflowStatus = "parked"
+)
+
+var workflowStatuses = map[WorkflowStatus]bool{
+	WorkflowActive: true, WorkflowWaiting: true, WorkflowBlocked: true,
+	WorkflowClosed: true, WorkflowParked: true,
+}
+
+// WorkflowItem is the operational overlay for one durable record.
+// It keeps workflow state separate from the low-level record status vocabulary.
+type WorkflowItem struct {
+	Record          Record         `json:"record"`
+	Status          WorkflowStatus `json:"status"`
+	Class           string         `json:"class"`
+	Area            string         `json:"area"`
+	NeedsNextAction bool           `json:"needs_next_action"`
+}
+
+type WorkflowInput struct {
+	Status          WorkflowStatus
+	Class           string
+	Area            string
+	NeedsNextAction bool
+}
+
+func NormalizeWorkflowInput(input WorkflowInput) (WorkflowInput, error) {
+	if input.Status == "" {
+		input.Status = WorkflowActive
+	}
+	if !workflowStatuses[input.Status] {
+		return WorkflowInput{}, fmt.Errorf("workflow status must be one of: active, waiting, blocked, closed, parked")
+	}
+	input.Class = strings.TrimSpace(input.Class)
+	input.Area = strings.TrimSpace(input.Area)
+	return input, nil
+}
+
+func RecordStatusForWorkflow(status WorkflowStatus) string {
+	switch status {
+	case WorkflowBlocked:
+		return "blocked"
+	case WorkflowClosed:
+		return "completed"
+	case WorkflowParked:
+		return "abandoned"
+	default:
+		return "active"
+	}
 }
 
 type ListOptions struct {

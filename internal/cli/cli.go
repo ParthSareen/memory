@@ -24,6 +24,28 @@ type compactContextJSON struct {
 	BriefEstimatedTokens int      `json:"brief_estimated_tokens"`
 }
 
+type compactWorkflowItem struct {
+	ID              string                    `json:"id"`
+	Title           string                    `json:"title"`
+	Status          workmemory.WorkflowStatus `json:"status"`
+	Class           string                    `json:"class"`
+	Area            string                    `json:"area"`
+	NeedsNextAction bool                      `json:"needs_next_action"`
+	Owners          []string                  `json:"owners"`
+	Repo            string                    `json:"repo"`
+	Branch          string                    `json:"branch"`
+	Worktree        string                    `json:"worktree"`
+	NextAction      string                    `json:"next_action"`
+	Links           []workmemory.ExternalLink `json:"links"`
+	Source          string                    `json:"source"`
+	UpdatedAt       string                    `json:"updated_at"`
+}
+
+type compactNowJSON struct {
+	Items []compactWorkflowItem `json:"items"`
+	Count int                   `json:"count"`
+}
+
 type stringList []string
 
 func (values *stringList) String() string {
@@ -104,6 +126,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return commandExport(dbPath, commandArgs, stdout, stderr)
 	case "import":
 		return commandImport(dbPath, commandArgs, stdin, stdout, stderr)
+	case "begin":
+		return commandBegin(dbPath, commandArgs, stdout, stderr)
+	case "now":
+		return commandNow(dbPath, commandArgs, stdout, stderr)
+	case "checkpoint", "wait", "handoff", "close", "park":
+		return commandWorkflowUpdate(dbPath, command, commandArgs, stdout, stderr)
 	default:
 		return fmt.Errorf("unknown command: %s", command)
 	}
@@ -125,6 +153,13 @@ Commands:
   link      add a typed external link or relationship
   export    export stable JSON
   import    import stable JSON
+  begin     create or resume a durable work item
+  now       show the compact active, waiting, and blocked queue
+  checkpoint update a work item at a meaningful state change
+  wait      mark a work item waiting
+  handoff   record concise evidence-backed handoff state
+  close     close a work item
+  park      park a work item
 
 Global options:
   --db PATH    SQLite path (or use WORK_MEMORY_DB)
@@ -427,6 +462,220 @@ func commandUpdate(dbPath string, args []string, stdin io.Reader, stdout, stderr
 	}
 	fmt.Fprintf(stdout, "Updated %s  %s (%s)\n", shortID(record.ID), record.Title, record.Status)
 	return nil
+}
+
+func commandBegin(dbPath string, args []string, stdout, stderr io.Writer) error {
+	flags := newFlagSet("begin", stderr)
+	title := flags.String("title", "", "work item title")
+	status := flags.String("status", "active", "active, waiting, blocked, closed, or parked")
+	class := flags.String("class", "", "work class")
+	area := flags.String("area", "", "operational area")
+	needsNextAction := flags.Bool("needs-next-action", true, "whether a next action is needed")
+	repo := flags.String("repo", "", "repository")
+	branch := flags.String("branch", "", "branch")
+	worktree := flags.String("worktree", "", "worktree path")
+	summary := flags.String("summary", "", "concise state")
+	decision := flags.String("decision", "", "durable decision")
+	evidence := flags.String("evidence", "", "supporting evidence")
+	openQuestions := flags.String("open-questions", "", "unresolved questions")
+	nextAction := flags.String("next-action", "", "next move")
+	source := flags.String("source", "", "source or tool")
+	toolRef := flags.String("tool-ref", "", "external non-threaded tool-run reference")
+	var owners, links stringList
+	flags.Var(&owners, "owner", "owner (repeatable)")
+	flags.Var(&links, "link", "TYPE=TARGET (repeatable)")
+	jsonOutput := flags.Bool("json", false, "emit compact JSON")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return errors.New("begin does not accept positional arguments")
+	}
+	if strings.TrimSpace(*title) == "" {
+		return errors.New("begin requires --title")
+	}
+	input := workmemory.RecordInput{Title: *title, Repo: *repo, Branch: *branch, Worktree: *worktree, Summary: *summary, Decision: *decision, Evidence: *evidence, OpenQuestions: *openQuestions, NextAction: *nextAction, Owners: owners, Source: *source}
+	for _, value := range links {
+		linkType, target, err := parseTypedTarget(value)
+		if err != nil {
+			return err
+		}
+		input.Links = append(input.Links, workmemory.ExternalLink{Type: linkType, Target: target})
+	}
+	if strings.TrimSpace(*toolRef) != "" {
+		input.Links = append(input.Links, workmemory.ExternalLink{Type: "tool-run", Target: *toolRef})
+	}
+	store, err := workmemory.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	item, created, err := store.BeginWorkflow(input, workmemory.WorkflowInput{Status: workmemory.WorkflowStatus(*status), Class: *class, Area: *area, NeedsNextAction: *needsNextAction})
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		return writeJSON(stdout, compactWorkflow(item), true)
+	}
+	verb := "Resumed"
+	if created {
+		verb = "Began"
+	}
+	fmt.Fprintf(stdout, "%s %s  %s (%s)\n", verb, shortID(item.Record.ID), item.Record.Title, item.Status)
+	return nil
+}
+
+func commandNow(dbPath string, args []string, stdout, stderr io.Writer) error {
+	flags := newFlagSet("now", stderr)
+	repo := flags.String("repo", "", "filter repository")
+	owner := flags.String("owner", "", "filter owner")
+	area := flags.String("area", "", "filter area")
+	priorityOwner := flags.String("priority-owner", "", "owner whose needed actions sort first")
+	limit := flags.Int("limit", 25, "maximum items")
+	jsonOutput := flags.Bool("json", false, "emit stable compact JSON")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 0 {
+		return errors.New("now does not accept positional arguments")
+	}
+	store, err := workmemory.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	items, err := store.Now(workmemory.NowOptions{Repo: *repo, Owner: *owner, Area: *area, PriorityOwner: *priorityOwner, Limit: *limit})
+	if err != nil {
+		return err
+	}
+	compact := make([]compactWorkflowItem, 0, len(items))
+	for _, item := range items {
+		compact = append(compact, compactWorkflow(item))
+	}
+	if *jsonOutput {
+		return writeJSON(stdout, compactNowJSON{Items: compact, Count: len(compact)}, true)
+	}
+	if len(compact) == 0 {
+		_, err := fmt.Fprintln(stdout, "No active work.")
+		return err
+	}
+	for _, item := range compact {
+		marker := ""
+		if item.NeedsNextAction {
+			marker = " needs action"
+		}
+		fmt.Fprintf(stdout, "%s  %-8s  %-10s  %s%s\n", shortID(item.ID), item.Status, item.Class, item.Title, marker)
+	}
+	return nil
+}
+
+func commandWorkflowUpdate(dbPath, command string, args []string, stdout, stderr io.Writer) error {
+	flags := newFlagSet(command, stderr)
+	status := flags.String("status", "", "active, waiting, blocked, closed, or parked")
+	class := flags.String("class", "", "replace work class")
+	area := flags.String("area", "", "replace operational area")
+	needsNextAction := flags.Bool("needs-next-action", false, "whether a next action is needed")
+	summary := flags.String("summary", "", "replace concise state")
+	decision := flags.String("decision", "", "replace durable decision")
+	evidence := flags.String("evidence", "", "replace supporting evidence")
+	openQuestions := flags.String("open-questions", "", "replace unresolved questions")
+	nextAction := flags.String("next-action", "", "replace next move")
+	jsonOutput := flags.Bool("json", false, "emit compact JSON")
+	positionals, err := parseInterspersed(flags, args)
+	if err != nil {
+		return err
+	}
+	if len(positionals) != 1 {
+		return fmt.Errorf("usage: memory %s RECORD_ID [FIELDS]", command)
+	}
+	visited := map[string]bool{}
+	flags.Visit(func(item *flag.Flag) { visited[item.Name] = true })
+	if command == "handoff" && strings.TrimSpace(*evidence) == "" {
+		return errors.New("handoff requires --evidence")
+	}
+	store, err := workmemory.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	current, err := store.WorkflowItem(positionals[0])
+	if err != nil {
+		return err
+	}
+	update := workmemory.UpdateInput{}
+	if visited["summary"] {
+		update.Summary = stringPointer(*summary)
+	}
+	if visited["decision"] {
+		update.Decision = stringPointer(*decision)
+	}
+	if visited["evidence"] {
+		update.Evidence = stringPointer(*evidence)
+	}
+	if visited["open-questions"] {
+		update.OpenQuestions = stringPointer(*openQuestions)
+	}
+	if visited["next-action"] {
+		update.NextAction = stringPointer(*nextAction)
+	}
+	workflow := workmemory.WorkflowInput{Status: current.Status, Class: current.Class, Area: current.Area, NeedsNextAction: current.NeedsNextAction}
+	if visited["status"] {
+		workflow.Status = workmemory.WorkflowStatus(*status)
+	}
+	if visited["class"] {
+		workflow.Class = *class
+	}
+	if visited["area"] {
+		workflow.Area = *area
+	}
+	if visited["needs-next-action"] {
+		workflow.NeedsNextAction = *needsNextAction
+	}
+	switch command {
+	case "wait":
+		if !visited["status"] {
+			workflow.Status = workmemory.WorkflowWaiting
+		}
+		if !visited["needs-next-action"] {
+			workflow.NeedsNextAction = true
+		}
+	case "handoff":
+		if !visited["status"] {
+			workflow.Status = workmemory.WorkflowWaiting
+		}
+	case "close":
+		if !visited["status"] {
+			workflow.Status = workmemory.WorkflowClosed
+		}
+		if !visited["needs-next-action"] {
+			workflow.NeedsNextAction = false
+		}
+		if !visited["next-action"] {
+			update.NextAction = stringPointer("")
+		}
+	case "park":
+		if !visited["status"] {
+			workflow.Status = workmemory.WorkflowParked
+		}
+		if !visited["needs-next-action"] {
+			workflow.NeedsNextAction = false
+		}
+	}
+	item, err := store.UpdateWorkflowItem(current.Record.ID, update, workflow)
+	if err != nil {
+		return err
+	}
+	if *jsonOutput {
+		return writeJSON(stdout, compactWorkflow(item), true)
+	}
+	fmt.Fprintf(stdout, "%s %s  %s (%s)\n", strings.Title(command), shortID(item.Record.ID), item.Record.Title, item.Status)
+	return nil
+}
+
+func compactWorkflow(item workmemory.WorkflowItem) compactWorkflowItem {
+	return compactWorkflowItem{ID: item.Record.ID, Title: item.Record.Title, Status: item.Status, Class: item.Class, Area: item.Area, NeedsNextAction: item.NeedsNextAction, Owners: item.Record.Owners, Repo: item.Record.Repo, Branch: item.Record.Branch, Worktree: item.Record.Worktree, NextAction: item.Record.NextAction, Links: item.Record.Links, Source: item.Record.Source, UpdatedAt: item.Record.UpdatedAt}
 }
 
 func commandList(dbPath string, args []string, stdout, stderr io.Writer) error {

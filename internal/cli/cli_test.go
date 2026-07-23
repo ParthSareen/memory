@@ -164,6 +164,147 @@ func TestScopedTopicContextDoesNotLeakGlobalFTSMatches(t *testing.T) {
 	}
 }
 
+func TestWorkflowCommandsCompactJSONAndQueue(t *testing.T) {
+	dbPath := initializedDB(t)
+	run := func(arguments ...string) compactWorkflowItem {
+		t.Helper()
+		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+		args := append([]string{"--db", dbPath}, arguments...)
+		args = append(args, "--json")
+		if code := Run(args, strings.NewReader(""), stdout, stderr); code != 0 {
+			t.Fatalf("%v failed: %s", arguments, stderr.String())
+		}
+		var item compactWorkflowItem
+		if err := json.Unmarshal(stdout.Bytes(), &item); err != nil {
+			t.Fatalf("decode %v: %v\n%s", arguments, err, stdout.String())
+		}
+		return item
+	}
+	agent := run("begin", "--title", "Agent follow-up", "--class", "build", "--area", "memory", "--repo", "memory", "--owner", "agent", "--next-action", "Implement tests")
+	parth := run("begin", "--title", "Parth decision", "--class", "review", "--area", "memory", "--repo", "memory", "--owner", "parth", "--next-action", "Choose contract")
+	if agent.Status != workmemory.WorkflowActive || parth.NeedsNextAction != true || parth.Class != "review" {
+		t.Fatalf("begin output = %#v %#v", agent, parth)
+	}
+	if item := run("checkpoint", agent.ID, "--status", "blocked", "--evidence", "Test fixture shows the blocked dependency", "--next-action", "Wait for fixture"); item.Status != workmemory.WorkflowBlocked {
+		t.Fatalf("checkpoint item = %#v", item)
+	}
+	if item := run("wait", parth.ID, "--next-action", "Wait for Parth"); item.Status != workmemory.WorkflowWaiting {
+		t.Fatalf("wait item = %#v", item)
+	}
+	if item := run("handoff", agent.ID, "--evidence", "Focused workflow test passes", "--summary", "Blocked work is ready for another tool", "--next-action", "Resume after fixture"); item.Status != workmemory.WorkflowWaiting || item.NextAction != "Resume after fixture" {
+		t.Fatalf("handoff item = %#v", item)
+	}
+	if item := run("close", parth.ID, "--summary", "Decision made"); item.Status != workmemory.WorkflowClosed || item.NeedsNextAction || item.NextAction != "" {
+		t.Fatalf("close item = %#v", item)
+	}
+	if item := run("park", agent.ID, "--summary", "Deferred intentionally"); item.Status != workmemory.WorkflowParked || item.NeedsNextAction {
+		t.Fatalf("park item = %#v", item)
+	}
+
+	queue := run("begin", "--title", "Needs Parth", "--class", "build", "--area", "memory", "--repo", "memory", "--owner", "parth", "--next-action", "Approve")
+	other := run("begin", "--title", "Needs agent", "--class", "build", "--area", "other", "--repo", "other", "--owner", "agent", "--next-action", "Run")
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	if code := Run([]string{"--db", dbPath, "now", "--repo", "memory", "--area", "memory", "--json"}, strings.NewReader(""), stdout, stderr); code != 0 {
+		t.Fatalf("now failed: %s", stderr.String())
+	}
+	var now compactNowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &now); err != nil {
+		t.Fatal(err)
+	}
+	if now.Count != 1 || now.Items[0].ID != queue.ID || now.Items[0].Owners[0] != "parth" {
+		t.Fatalf("filtered queue = %#v", now)
+	}
+	if strings.Contains(stdout.String(), "summary") || strings.Contains(stdout.String(), "evidence") || other.ID == "" {
+		t.Fatalf("now JSON is not compact: %s", stdout.String())
+	}
+	priorityAgent := run("begin", "--title", "Agent priority", "--class", "build", "--area", "priority", "--repo", "memory", "--owner", "agent", "--next-action", "Handle first")
+	run("begin", "--title", "Other priority", "--class", "build", "--area", "priority", "--repo", "memory", "--owner", "other", "--next-action", "Handle later")
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"--db", dbPath, "now", "--area", "priority", "--priority-owner", "agent", "--json"}, strings.NewReader(""), stdout, stderr); code != 0 {
+		t.Fatalf("priority now failed: %s", stderr.String())
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &now); err != nil {
+		t.Fatal(err)
+	}
+	if now.Count != 2 || now.Items[0].ID != priorityAgent.ID {
+		t.Fatalf("priority queue = %#v", now)
+	}
+}
+
+func TestWorkflowFailedCheckpointIsAtomic(t *testing.T) {
+	dbPath := initializedDB(t)
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	if code := Run([]string{"--db", dbPath, "begin", "--title", "Atomic checkpoint", "--class", "build", "--summary", "before", "--json"}, strings.NewReader(""), stdout, stderr); code != 0 {
+		t.Fatalf("begin failed: %s", stderr.String())
+	}
+	var begun compactWorkflowItem
+	if err := json.Unmarshal(stdout.Bytes(), &begun); err != nil {
+		t.Fatal(err)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"--db", dbPath, "checkpoint", begun.ID, "--status", "invalid", "--summary", "after failed command", "--json"}, strings.NewReader(""), stdout, stderr); code != 2 {
+		t.Fatalf("checkpoint code=%d stderr=%s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run([]string{"--db", dbPath, "show", begun.ID, "--json"}, strings.NewReader(""), stdout, stderr); code != 0 {
+		t.Fatalf("show failed: %s", stderr.String())
+	}
+	var record workmemory.Record
+	if err := json.Unmarshal(stdout.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Summary != "before" || record.Status != "active" {
+		t.Fatalf("failed lifecycle command mutated record: %#v", record)
+	}
+}
+
+func TestWorkflowToolRunLinkResumesWithoutThread(t *testing.T) {
+	dbPath := initializedDB(t)
+	runBegin := func(title string, extra ...string) compactWorkflowItem {
+		t.Helper()
+		stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+		args := []string{"--db", dbPath, "begin", "--title", title, "--class", "build", "--tool-ref", "terminal:run-42", "--source", "terminal"}
+		args = append(args, extra...)
+		args = append(args, "--json")
+		if code := Run(args, strings.NewReader(""), stdout, stderr); code != 0 {
+			t.Fatalf("begin failed: %s", stderr.String())
+		}
+		var item compactWorkflowItem
+		if err := json.Unmarshal(stdout.Bytes(), &item); err != nil {
+			t.Fatal(err)
+		}
+		return item
+	}
+	first := runBegin("Run without a thread", "--link", "issue=memory#42")
+	second := runBegin("Resumed external run")
+	if first.ID != second.ID || second.Title != "Resumed external run" {
+		t.Fatalf("tool run did not resume: first=%#v second=%#v", first, second)
+	}
+	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
+	if code := Run([]string{"--db", dbPath, "now", "--json"}, strings.NewReader(""), stdout, stderr); code != 0 {
+		t.Fatalf("now failed: %s", stderr.String())
+	}
+	var now compactNowJSON
+	if err := json.Unmarshal(stdout.Bytes(), &now); err != nil {
+		t.Fatal(err)
+	}
+	if now.Count != 1 || len(now.Items[0].Links) != 2 || !containsWorkflowLink(now.Items[0].Links, "tool-run", "terminal:run-42") || !containsWorkflowLink(now.Items[0].Links, "issue", "memory#42") {
+		t.Fatalf("external link = %#v", now)
+	}
+}
+
+func containsWorkflowLink(links []workmemory.ExternalLink, linkType, target string) bool {
+	for _, link := range links {
+		if link.Type == linkType && link.Target == target {
+			return true
+		}
+	}
+	return false
+}
+
 func containsString(values []string, target string) bool {
 	for _, value := range values {
 		if value == target {

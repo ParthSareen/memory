@@ -1,0 +1,4 @@
+interface:
+  display_name: "Work Memory"
+  short_description: "Track and retrieve durable local work context"
+  default_prompt: "Use $work-memory to retrieve scoped context, track this work item, and leave a concise handoff."

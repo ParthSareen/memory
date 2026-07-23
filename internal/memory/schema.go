@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS relationships (
 CREATE INDEX IF NOT EXISTS relationships_from_idx ON relationships(from_record_id);
 CREATE INDEX IF NOT EXISTS relationships_to_idx ON relationships(to_record_id);
 
+CREATE TABLE IF NOT EXISTS work_items (
+    record_id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('active', 'waiting', 'blocked', 'closed', 'parked')),
+    class TEXT NOT NULL DEFAULT '',
+    area TEXT NOT NULL DEFAULT '',
+    needs_next_action INTEGER NOT NULL DEFAULT 0 CHECK (needs_next_action IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS work_items_queue_idx
+ON work_items(status, needs_next_action DESC);
+CREATE INDEX IF NOT EXISTS work_items_area_idx ON work_items(area COLLATE NOCASE);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS record_fts USING fts5(
     title,
     summary,

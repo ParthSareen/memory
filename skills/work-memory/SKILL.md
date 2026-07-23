@@ -23,9 +23,27 @@ memory context "release configuration" \
 - Use normal or compact `--json` output for agents. Reserve `--json-full` for human diagnostics because it is intentionally unbounded.
 - If no scoped record exists, say so rather than treating an unscoped search as authoritative.
 
+## Workflow state
+
+For active work, after retrieval, begin or resume exactly one work item. Its durable record ID carries continuity; a thread ID is optional metadata, never required. The work item is also the durable outcome record, so do not create a second record at handoff.
+
+```sh
+memory begin \
+  --title "Configuration migration" --status active --class build --area configuration \
+  --owner owner --repo example/repository --branch feature/config \
+  --next-action "Validate the migration." --json
+```
+
+- Use `memory now --priority-owner OWNER --json` for the compact active/waiting/blocked queue when one owner's needed actions should lead. The generic CLI has no default priority owner.
+- Use `checkpoint` only at a meaningful state change. Use `wait` or `checkpoint --status blocked` for a dependency; use `handoff` with concise evidence and a next action; use `close` (which clears a stale next action unless replaced) or `park` when appropriate.
+- For a non-threaded tool run, attach `--tool-ref TOOL:RUN`. A later tool can resume that work item without inventing a thread ID.
+- Harnesses and scripts use `--json`; do not scrape human output.
+
+For an external task runner, begin the item before launch, pass the returned record ID to the task, attach the task or run link afterward, and require the task to hand off the same record with evidence and a next action.
+
 ## Record
 
-Write one concise outcome at a meaningful boundary: a decision, implementation handoff, review result, incident analysis, or completed task.
+Use `record` for a standalone decision, review, incident analysis, or outcome that was never tracked as a workflow item.
 
 ```sh
 memory record --input - --json <<'JSON'
@@ -65,6 +83,7 @@ Verify consequential writes with `memory show RECORD_ID --json`.
 
 ## Boundaries
 
-- Keep the source system for live task tracking separate from work memory. Work memory is the durable decision, evidence, and handoff layer.
+- The workflow queue is the live execution index for work tracked in this local store.
+- Keep planning backlogs and external source systems separate; link their artifacts into the work item.
 - Link source artifacts rather than copying them into records.
 - Prefer bounded, scoped retrieval over broad historical recall.

@@ -97,12 +97,12 @@ func Initialize(path string) (*Store, error) {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return cleanup(fmt.Errorf("read schema version: %w", err))
 	}
-	if version != 0 && version != SchemaVersion {
-		return cleanup(fmt.Errorf("unsupported database schema version %d; expected %d", version, SchemaVersion))
-	}
 	var journalMode string
 	if err := db.QueryRow("PRAGMA journal_mode = WAL").Scan(&journalMode); err != nil {
 		return cleanup(fmt.Errorf("enable WAL: %w", err))
+	}
+	if err := migrate(db, version); err != nil {
+		return cleanup(err)
 	}
 	if _, err := db.Exec(schema); err != nil {
 		return cleanup(fmt.Errorf("initialize schema: %w", err))
@@ -137,11 +137,45 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("read schema version: %w", err)
 	}
-	if version != SchemaVersion {
+	if err := migrate(db, version); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("unsupported database schema version %d; expected %d", version, SchemaVersion)
+		return nil, err
+	}
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("initialize schema: %w", err)
+	}
+	if _, err := db.Exec("INSERT OR REPLACE INTO metadata(key, value) VALUES ('schema_version', ?)", fmt.Sprint(SchemaVersion)); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("write schema metadata: %w", err)
+	}
+	if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", SchemaVersion)); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set schema version: %w", err)
 	}
 	return &Store{db: db, path: path}, nil
+}
+
+func migrate(db *sql.DB, version int) error {
+	if version == 0 || version == SchemaVersion {
+		return nil
+	}
+	if version != 1 {
+		return fmt.Errorf("unsupported database schema version %d; expected %d", version, SchemaVersion)
+	}
+	if _, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS work_items (
+    record_id TEXT PRIMARY KEY REFERENCES records(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK (status IN ('active', 'waiting', 'blocked', 'closed', 'parked')),
+    class TEXT NOT NULL DEFAULT '',
+    area TEXT NOT NULL DEFAULT '',
+    needs_next_action INTEGER NOT NULL DEFAULT 0 CHECK (needs_next_action IN (0, 1))
+);
+CREATE INDEX IF NOT EXISTS work_items_queue_idx ON work_items(status, needs_next_action DESC);
+CREATE INDEX IF NOT EXISTS work_items_area_idx ON work_items(area COLLATE NOCASE);`); err != nil {
+		return fmt.Errorf("migrate schema v1 to v2: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -195,6 +229,25 @@ func (s *Store) UpdateRecord(value string, update UpdateInput) (Record, error) {
 	if err != nil {
 		return Record{}, err
 	}
+	updated, err := updatedRecord(current, update)
+	if err != nil {
+		return Record{}, err
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		return Record{}, err
+	}
+	if err := replaceRecord(context.Background(), tx, updated); err != nil {
+		tx.Rollback()
+		return Record{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Record{}, err
+	}
+	return s.GetRecord(id)
+}
+
+func updatedRecord(current Record, update UpdateInput) (Record, error) {
 	input := RecordInput{
 		Title: current.Title, Status: current.Status, Repo: current.Repo, Branch: current.Branch,
 		Worktree: current.Worktree, Summary: current.Summary, Decision: current.Decision,
@@ -254,18 +307,7 @@ func (s *Store) UpdateRecord(value string, update UpdateInput) (Record, error) {
 			updated.Links[index].CreatedAt = updatedAt
 		}
 	}
-	tx, err := s.db.BeginTx(context.Background(), nil)
-	if err != nil {
-		return Record{}, err
-	}
-	if err := replaceRecord(context.Background(), tx, updated); err != nil {
-		tx.Rollback()
-		return Record{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return Record{}, err
-	}
-	return s.GetRecord(id)
+	return updated, nil
 }
 
 func insertRecord(ctx context.Context, executor sqlExecutor, record Record) error {
